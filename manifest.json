@@ -1,0 +1,9 @@
+{
+  "id": "ntfy-reminders",
+  "name": "NTFY Reminders",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Send ntfy reminders from obsidian hotkey opens modal to set a date.",
+  "author": "kr-nn",
+  "isDesktopOnly": true
+}
