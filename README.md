@@ -2,6 +2,7 @@
 
 I do **not** know JavaScript. I do **not** know how Obsidian plugins work. This plugin is held together with vibes, logs, and a stubborn need to get reminders out of my notes and into my phone via **ntfy**. Use at your own delight/risk 😄
 
+bonus: included a non-vibecoded nixos module to make obsidian run in a webbrowser
 ---
 
 ## How to use
