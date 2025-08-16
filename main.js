@@ -3,38 +3,53 @@ const {
   PluginSettingTab, Setting,
   EditorSuggest, MarkdownView, Modal
 } = require("obsidian");
+const os = require("os");
 
 /*** DEFAULT SETTINGS ***/
 const DEFAULTS = {
-  serverUrl: "https://ntfy.sh/app",
+  serverUrl: "https://ntfy.sh",
   topic: "tasks",
-  authHeader: "",                 // e.g. "Bearer XXX"
+  authHeader: "",
   title: "NTFY Reminders",
   tags: "",
-  iconUrl: "",                    // optional: icon URL for notifications
-  suggestStepMin: 5,              // minutes between @ suggestions (1–60)
-  insert12h: true                 // picker inserts 12-hour times if true; 24h if false
+  iconUrl: "",
+  suggestStepMin: 5,
+  insert12h: true,
+  dismissStatusChars: "x/-",
+
+
+  senderHostnames: "",
+  senderIPsCidrs: ""
 };
 
 /*** CONSTANTS (not user-facing) ***/
 const RESCAN_INTERVAL_MIN = 10;
-const SUGGEST_DAYS = 14;           // how far ahead @ suggestions scan
-const SUGGEST_MAX  = 5000;         // soft cap for candidate grid
-const SCHEDULE_DEBOUNCE_MS = 2000; // debounce after edits to avoid ghost timers
+const SUGGEST_DAYS = 14;
+const SUGGEST_MAX  = 5000;
+const SCHEDULE_DEBOUNCE_MS = 2000;
+const MAX_TIMEOUT_MS = 0x7fffffff;
 
 module.exports = class NtfyReminders extends Plugin {
   async onload() {
-    // timer bookkeeping
-    this.timerHandles = new Map();   // id -> setTimeout handle
-    this.fileTimers = new Map();     // filePath -> Set(timerIds)
-    this.pendingRescans = new Map(); // filePath -> debounce handle
+
+    this.timerHandles = new Map();
+    this.fileTimers = new Map();
+    this.pendingRescans = new Map();
 
     this.settings = Object.assign({}, DEFAULTS, await this.loadData());
+
+
+    this.localIdentity = getLocalIdentity();
+
+    this.isSender = computeIsSender(this.settings, this.localIdentity);
+
     console.log("[NTFY Reminders] onload with settings:", this.settings);
+    console.log("[NTFY Reminders] local identity:", this.localIdentity);
+    console.log("[NTFY Reminders] role:", this.isSender ? "SENDER" : "SILENT");
 
     this.addSettingTab(new NtfySettingsTab(this.app, this));
 
-    // Commands
+
     this.addCommand({
       id: "ntfy-scan-vault-now",
       name: "NTFY: scan vault now",
@@ -44,19 +59,19 @@ module.exports = class NtfyReminders extends Plugin {
       id: "ntfy-enter-reminder",
       name: "NTFY: enter reminder",
       callback: () => openReminderPicker(this.app, this),
-      hotkeys: [{ modifiers: ["Ctrl"], key: "R" }] // default hotkey
+      hotkeys: [{ modifiers: ["Ctrl"], key: "R" }]
     });
 
-    // Editor suggest: digit-fuzzy @time picker (inserts ⏰ …)
+
     this.registerEditorSuggest(new AtTimeDigitsSuggest(this.app, this));
 
-    // Initial full rescan (clears + schedules)
+
     await this.scanVault();
 
-    // Periodic rescan (clears + schedules cleanly)
+
     this.registerInterval(window.setInterval(() => this.scanVault(), RESCAN_INTERVAL_MIN * 60 * 1000));
 
-    // Debounced rescan on modify
+
     this.registerEvent(this.app.vault.on("modify", (f) => {
       if (f instanceof TFile && f.extension === "md") this.queueReschedule(f);
     }));
@@ -73,8 +88,32 @@ module.exports = class NtfyReminders extends Plugin {
 
   async saveSettings() { await this.saveData(this.settings); }
 
+  /** Recompute sender role and act if it changed */
+  async recomputeSenderRole() {
+    const prev = this.isSender;
+    this.localIdentity = getLocalIdentity();
+    this.isSender = computeIsSender(this.settings, this.localIdentity);
+    console.log("[NTFY Reminders] recompute role:", this.isSender ? "SENDER" : "SILENT", this.localIdentity);
+    if (prev && !this.isSender) {
+
+      this.clearAllTimers();
+    } else if (!prev && this.isSender) {
+
+      await this.scanVault();
+    }
+  }
+
+  /** Cancel and forget all timers across all files */
+  clearAllTimers() {
+    for (const h of this.timerHandles.values()) window.clearTimeout(h);
+    this.timerHandles.clear();
+    this.fileTimers.clear();
+    console.log("[NTFY Reminders] cleared ALL timers (role is SILENT)");
+  }
+
   /** Debounced re-schedule for one file after edits */
   queueReschedule(file) {
+    if (!this.isSender) return;
     const key = file.path;
     const prev = this.pendingRescans.get(key);
     if (prev) window.clearTimeout(prev);
@@ -85,21 +124,17 @@ module.exports = class NtfyReminders extends Plugin {
     this.pendingRescans.set(key, handle);
   }
 
-  /** Clear all timers for a file, then parse & schedule fresh */
-  async scheduleFileFresh(file) {
-    try {
-      this.clearTimersForFile(file.path);
-      await this.scheduleFromFileNoClear(file);
-    } catch (e) {
-      console.error("[NTFY Reminders] scheduleFileFresh error:", file?.path, e);
-    }
-  }
-
-  /** Full vault rescan: clear per-file timers first, then schedule */
+  /** Full vault rescan: if silent, just clear; else clear per-file timers first, then schedule */
   async scanVault() {
     try {
       const files = this.app.vault.getMarkdownFiles();
-      console.log("[NTFY Reminders] scanning vault, md files:", files.length);
+      console.log("[NTFY Reminders] scanning vault, md files:", files.length, "role:", this.isSender ? "SENDER" : "SILENT");
+      if (!this.isSender) {
+
+        this.clearAllTimers();
+        new Notice("NTFY: silent (not sender) – no notifications from this device");
+        return;
+      }
       for (const f of files) await this.scheduleFileFresh(f);
       new Notice("NTFY: vault scanned");
     } catch (e) {
@@ -107,56 +142,113 @@ module.exports = class NtfyReminders extends Plugin {
     }
   }
 
-  /** INTERNAL: parse/schedule without clearing first */
+  /** Clear all timers for a file, then parse & schedule fresh */
+  async scheduleFileFresh(file) {
+    try {
+      if (!this.isSender) { this.clearTimersForFile(file.path); return; }
+      this.clearTimersForFile(file.path);
+      await this.scheduleFromFileNoClear(file);
+    } catch (e) {
+      console.error("[NTFY Reminders] scheduleFileFresh error:", file?.path, e);
+    }
+  }
+
+  /** INTERNAL: parse/schedule without clearing first (only when sender) */
   async scheduleFromFileNoClear(file) {
+    if (!this.isSender) return;
     const text = await this.app.vault.read(file);
     const lines = text.split(/\r?\n/);
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
 
-      // Only schedule when there is a ⏰ YYYY-MM-DD ...
-      const parsed = parseClockEmoji(line);
-      if (!parsed) continue;
 
-      const { when, context, raw } = parsed;
-      if (!when.isValid() || when.isBefore(moment())) {
-        console.log("[NTFY Reminders] skip ⏰ (invalid or past)", { raw, targetISO: when.toISOString?.() });
+      const status = getTaskStatusChar(line);
+      if (status != null && shouldDismissStatus(status, this.settings.dismissStatusChars)) {
+        console.log("[NTFY Reminders] skip (dismiss by task status)", { status, lineIndex: i, file: file.path });
         continue;
       }
 
-      const prio = detectPriority(line); // 1..5 (ntfy)
-      const id = `${file.path}#${i}#${when.unix()}`;
-      if (this.timerHandles.has(id)) continue;
 
-      const ms = when.valueOf() - Date.now();
-      console.log("[NTFY Reminders] SCHEDULE", {
-        file: file.path, line: i, targetISO: when.toISOString(), ms, prio, textSample: context.slice(0, 80)
-      });
+      const matches = parseClockEmojiAll(line);
+      if (!matches.length) continue;
 
-      if (ms <= 0 || ms > 0x7fffffff) continue;
+      const prio = detectPriority(line);
+      for (const p of matches) {
+        const { when, context, raw, offset, recur } = p;
+        if (!when.isValid()) continue;
 
-      const handle = window.setTimeout(async () => {
-        try {
-          console.log("[NTFY Reminders] FIRING", { file: file.path, line: i, at: new Date().toISOString(), prio });
-          await this.sendNtfy(context || line, prio);
-        } catch (err) {
-          console.error("[NTFY Reminders] fire error:", err);
-        } finally {
-          // remove this timer id from bookkeeping
-          this.timerHandles.delete(id);
-          const set = this.fileTimers.get(file.path);
-          if (set) {
-            set.delete(id);
-            if (set.size === 0) this.fileTimers.delete(file.path);
+        let firstWhen = when.clone();
+        const now = moment();
+
+        if (recur) {
+          firstWhen = advanceToFuture(firstWhen, recur, now);
+          if (!firstWhen || !firstWhen.isValid()) continue;
+        } else {
+          if (!firstWhen.isAfter(now)) {
+            console.log("[NTFY Reminders] skip one-shot past ⏰", { raw, at: when.toISOString() });
+            continue;
           }
         }
-      }, ms);
 
-      // track handle + file mapping
-      this.timerHandles.set(id, handle);
-      if (!this.fileTimers.has(file.path)) this.fileTimers.set(file.path, new Set());
-      this.fileTimers.get(file.path).add(id);
+        this.scheduleOneReminder(file.path, i, firstWhen, prio, context || line, offset, recur);
+      }
     }
+  }
+
+  /** Schedule a single reminder occurrence and (optionally) its recurrence chain */
+  scheduleOneReminder(filePath, lineIndex, when, prio, context, offset, recur) {
+    const id = `${filePath}#${lineIndex}#${when.unix()}#${offset}`;
+    if (this.timerHandles.has(id)) return;
+
+    const ms = when.valueOf() - Date.now();
+    if (ms <= 0) return;
+    if (ms > MAX_TIMEOUT_MS) {
+
+      console.log("[NTFY Reminders] skip scheduling far future (>~24.8d)", {
+        filePath, lineIndex, targetISO: when.toISOString(), recur
+      });
+      return;
+    }
+
+    console.log("[NTFY Reminders] SCHEDULE", {
+      file: filePath, line: lineIndex, targetISO: when.toISOString(), ms, prio, offset, recur
+    });
+
+    const handle = window.setTimeout(async () => {
+      try {
+
+        if (!this.isSender) {
+          console.log("[NTFY Reminders] SKIP fire (role became SILENT)");
+        } else {
+          console.log("[NTFY Reminders] FIRING", {
+            file: filePath, line: lineIndex, at: new Date().toISOString(), prio, offset, recur
+          });
+          await this.sendNtfy(context, prio);
+        }
+      } catch (err) {
+        console.error("[NTFY Reminders] fire error:", err);
+      } finally {
+
+        this.timerHandles.delete(id);
+        const set = this.fileTimers.get(filePath);
+        if (set) {
+          set.delete(id);
+          if (set.size === 0) this.fileTimers.delete(filePath);
+        }
+
+
+        if (recur && this.isSender) {
+          const now = moment();
+          let next = when.clone().add(recur.every, recur.unit);
+          while (!next.isAfter(now)) next.add(recur.every, recur.unit);
+          this.scheduleOneReminder(filePath, lineIndex, next, prio, context, offset, recur);
+        }
+      }
+    }, ms);
+
+    this.timerHandles.set(id, handle);
+    if (!this.fileTimers.has(filePath)) this.fileTimers.set(filePath, new Set());
+    this.fileTimers.get(filePath).add(id);
   }
 
   /** Cancel and forget all timers tied to this file */
@@ -178,12 +270,12 @@ module.exports = class NtfyReminders extends Plugin {
     const headers = {
       "X-Title": s.title || DEFAULTS.title,
       "X-Tags": s.tags || DEFAULTS.tags,
-      "X-Priority": String(priority)        // 1=min, 2=low, 3=default, 4=high, 5=max
+      "X-Priority": String(priority)
     };
     if (s.authHeader && s.authHeader.trim()) headers["Authorization"] = s.authHeader.trim();
     if (s.iconUrl && s.iconUrl.length) {
-      headers["X-Icon"] = s.iconUrl;       // primary
-      headers["Icon"]  = s.iconUrl;        // alias
+      headers["X-Icon"] = s.iconUrl;
+      headers["Icon"]  = s.iconUrl;
     }
 
     console.log("[NTFY Reminders] POST", {
@@ -208,6 +300,11 @@ class NtfySettingsTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl("h3", { text: "NTFY Reminders" });
+
+
+    const id = this.plugin.localIdentity;
+    const roleDiv = containerEl.createDiv({ cls: "ntfy-role" });
+    roleDiv.setText(`This instance is: ${this.plugin.isSender ? "SENDER ✅" : "SILENT 🚫"}  (host: ${id.hostname}; IPs: ${id.ipv4.join(", ") || "none"})`);
 
     new Setting(containerEl).setName("Server URL").setDesc("e.g. https://ntfy.example.com")
       .addText(t => t.setValue(this.plugin.settings.serverUrl)
@@ -252,53 +349,235 @@ class NtfySettingsTab extends PluginSettingTab {
       .addToggle(tg => tg
         .setValue(!!this.plugin.settings.insert12h)
         .onChange(async v => { this.plugin.settings.insert12h = v; await this.plugin.saveSettings(); }));
+
+    new Setting(containerEl)
+      .setName("Dismiss task statuses")
+      .setDesc("Chars that suppress reminders on task lines (e.g. x/-). Case-insensitive.")
+      .addText(t => t
+        .setPlaceholder("x-/")
+        .setValue(this.plugin.settings.dismissStatusChars || "")
+        .onChange(async v => { this.plugin.settings.dismissStatusChars = v; await this.plugin.saveSettings(); }));
+
+
+    containerEl.createEl("h4", { text: "Sender (who sends notifications)" });
+
+    new Setting(containerEl)
+      .setName("Allowed hostnames")
+      .setDesc("Comma-separated exact hostnames. If set, this device must match either host or IP/CIDR to send.")
+      .addText(t => t
+        .setPlaceholder("obsidian")
+        .setValue(this.plugin.settings.senderHostnames || "")
+        .onChange(async v => {
+          this.plugin.settings.senderHostnames = v.trim();
+          await this.plugin.saveSettings();
+          await this.plugin.recomputeSenderRole();
+          roleDiv.setText(`This instance is: ${this.plugin.isSender ? "SENDER ✅" : "SILENT 🚫"}  (host: ${this.plugin.localIdentity.hostname}; IPs: ${this.plugin.localIdentity.ipv4.join(", ") || "none"})`);
+        }));
+
+    new Setting(containerEl)
+      .setName("Allowed IPs/CIDRs")
+      .setDesc("Comma-separated IPv4 rules, e.g. 10.0.0.1, 10.0.0.1/24, or prefix like 10.0.0.")
+      .addText(t => t
+        .setPlaceholder("10.0.0.1")
+        .setValue(this.plugin.settings.senderIPsCidrs || "")
+        .onChange(async v => {
+          this.plugin.settings.senderIPsCidrs = v.trim();
+          await this.plugin.saveSettings();
+          await this.plugin.recomputeSenderRole();
+          roleDiv.setText(`This instance is: ${this.plugin.isSender ? "SENDER ✅" : "SILENT 🚫"}  (host: ${this.plugin.localIdentity.hostname}; IPs: ${this.plugin.localIdentity.ipv4.join(", ") || "none"})`);
+        }));
   }
 }
 
-/** ===== Helpers ===== **/
+/** ===== Helpers: sender gating ===== **/
 
-// Parse: "… ⏰ YYYY-MM-DD HH:mm"  or  "… ⏰ YYYY-MM-DD h:mm AM/PM"
-function parseClockEmoji(line) {
-  const re = /⏰\s*(\d{4}-\d{2}-\d{2})\s+(\d{1,2})(?::([0-5]\d))?\s*(am|pm)?\b/i;
-  const m = re.exec(line);
+function getLocalIdentity() {
+  const hostname = (os.hostname?.() || "").trim();
+  const ifaces = os.networkInterfaces?.() || {};
+  const ipv4 = [];
+  for (const arr of Object.values(ifaces)) {
+    for (const ni of arr || []) {
+      if (ni && ni.family === "IPv4" && !ni.internal && ni.address) ipv4.push(ni.address);
+    }
+  }
+  return { hostname, ipv4 };
+}
+
+function computeIsSender(settings, identity) {
+  const hostList = parseList(settings.senderHostnames);
+  const ipRules  = parseIPRules(settings.senderIPsCidrs);
+
+  if (hostList.length === 0 && ipRules.length === 0) {
+
+    return true;
+  }
+
+  const hn = (identity.hostname || "").toLowerCase();
+  const hostMatch = hostList.some(h => h.toLowerCase() === hn);
+
+
+  let ipMatch = false;
+  for (const ip of identity.ipv4) {
+    if (ipRules.some(rule => ipMatchesRule(ip, rule))) { ipMatch = true; break; }
+  }
+
+  return hostMatch || ipMatch;
+}
+
+function parseList(s) {
+  if (!s) return [];
+  return s.split(",").map(x => x.trim()).filter(Boolean);
+}
+
+function parseIPRules(s) {
+  const out = [];
+  if (!s) return out;
+  for (const raw of s.split(",").map(x => x.trim()).filter(Boolean)) {
+    if (/^\d+\.\d+\.\d+\.\d+\/\d+$/.test(raw)) {
+
+      const [ip, bitsStr] = raw.split("/");
+      const bits = clampInt(bitsStr, 0, 32);
+      const ipInt = ipv4ToInt(ip);
+      if (ipInt != null) {
+        const mask = bits === 0 ? 0 : (~0 >>> (32 - bits)) << (32 - bits);
+        out.push({ kind: "cidr", ipInt, mask, bits });
+      }
+    } else if (/^\d+\.\d+\.\d+\.\d+$/.test(raw)) {
+
+      const ipInt = ipv4ToInt(raw);
+      if (ipInt != null) out.push({ kind: "exact", ipInt, ip: raw });
+    } else if (/^\d+\.\d+\.\d+\.$/.test(raw) || /^\d+\.\d+\.$/.test(raw) || /^\d+\.$/.test(raw)) {
+
+      out.push({ kind: "prefix", prefix: raw });
+    } else {
+
+      if (/^\d+\.\d+\.\d+$/.test(raw)) out.push({ kind: "prefix", prefix: raw + "." });
+      else if (/^\d+\.\d+$/.test(raw)) out.push({ kind: "prefix", prefix: raw + "." });
+      else if (/^\d+$/.test(raw)) out.push({ kind: "prefix", prefix: raw + "." });
+
+    }
+  }
+  return out;
+}
+
+function ipMatchesRule(ip, rule) {
+  if (!ip) return false;
+  if (rule.kind === "prefix") return ip.startsWith(rule.prefix);
+  const int = ipv4ToInt(ip);
+  if (int == null) return false;
+  if (rule.kind === "exact") return int === rule.ipInt;
+  if (rule.kind === "cidr") {
+    return (int & rule.mask) === (rule.ipInt & rule.mask);
+  }
+  return false;
+}
+
+function ipv4ToInt(ip) {
+  const m = ip.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
   if (!m) return null;
-
-  const dateStr = m[1];
-  let hh = parseInt(m[2], 10);
-  const mm = m[3] ? parseInt(m[3], 10) : 0;
-  const ap = m[4] ? m[4].toLowerCase() : null;
-
-  if (ap) {                       // 12h → 24h
-    if (ap === "pm" && hh < 12) hh += 12;
-    if (ap === "am" && hh === 12) hh = 0;
-  }
-  if (hh > 23 || mm > 59) return null;
-
-  const when = moment(`${dateStr} ${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`, "YYYY-MM-DD HH:mm", true);
-  if (!when.isValid()) return null;
-
-  // Context = the line with the ⏰ timestamp removed
-  const start = m.index;
-  const end = m.index + m[0].length;
-  const before = line.slice(0, start).trim();
-  const after = line.slice(end).trim();
-  const context = (before + (before && after ? " " : "") + after).trim();
-
-  console.log("[NTFY Reminders] ⏰ parsed:", { raw: m[0], date: dateStr, hh24: hh, mm, context });
-  return { when, context, raw: m[0] };
+  const a = [+m[1], +m[2], +m[3], +m[4]];
+  for (const n of a) if (n < 0 || n > 255) return null;
+  return ((a[0] << 24) >>> 0) + (a[1] << 16) + (a[2] << 8) + a[4 - 1];
 }
 
-// Emoji → ntfy priority 1..5
+/** ===== Helpers: tasks status & parsing ===== **/
+
+
+function getTaskStatusChar(line) {
+  const m = line.match(/^\s*[-*]\s*\[([^\]])\]/);
+  if (!m) return null;
+  return m[1];
+}
+
+
+function shouldDismissStatus(statusChar, dismissCharsSetting) {
+  if (!dismissCharsSetting) return false;
+  const set = new Set(dismissCharsSetting.toLowerCase().split(""));
+  return set.has(statusChar.toLowerCase());
+}
+
+
+function parseClockEmojiAll(line) {
+  const tsRe = /⏰\s*(\d{4}-\d{2}-\d{2})\s+(\d{1,2})(?::([0-5]\d))?\s*(am|pm)?\b/ig;
+  const all = [...line.matchAll(tsRe)];
+  const out = [];
+  for (let k = 0; k < all.length; k++) {
+    const m = all[k];
+    const start = m.index;
+    const raw = m[0];
+    const end = start + raw.length;
+    const nextStart = (all[k + 1]?.index ?? line.length);
+
+
+    const dateStr = m[1];
+    let hh = parseInt(m[2], 10);
+    const mm = m[3] ? parseInt(m[3], 10) : 0;
+    const ap = m[4] ? m[4].toLowerCase() : null;
+    if (ap) { if (ap === "pm" && hh < 12) hh += 12; if (ap === "am" && hh === 12) hh = 0; }
+    if (hh > 23 || mm > 59) continue;
+
+    const when = moment(`${dateStr} ${String(hh).padStart(2,"0")}:${String(mm).padStart(2,"0")}`, "YYYY-MM-DD HH:mm", true);
+    if (!when.isValid()) continue;
+
+
+    const tail = line.slice(end, nextStart);
+    const rm = tail.match(/^\s*every\s+(\d+)\s*(minutes?|minute|min|m|hours?|hour|hr|h|days?|day|d|weeks?|week|w)\b/i);
+    let recur = null;
+    let end2 = end;
+    if (rm) {
+      const every = Math.max(1, parseInt(rm[1], 10) || 0);
+      const unitTok = rm[2].toLowerCase();
+      const unit = normalizeUnit(unitTok);
+      if (every > 0 && unit) {
+        recur = { every, unit };
+        end2 = end + rm[0].length;
+      }
+    }
+
+
+    const before = line.slice(0, start).trim();
+    const after  = line.slice(end2).trim();
+    const context = (before + (before && after ? " " : "") + after).trim();
+
+    out.push({ when, context, raw, offset: start, recur });
+  }
+  return out;
+}
+
+function normalizeUnit(tok) {
+  if (/(^m(in(ute)?s?)?$)|^mins?$|^m$/.test(tok)) return "minutes";
+  if (/^h(ours?)?$|^hrs?$|^h$/.test(tok)) return "hours";
+  if (/^d(ays?)?$|^d$/.test(tok)) return "days";
+  if (/^w(eeks?)?$|^w$/.test(tok)) return "weeks";
+  return null;
+}
+
+
+function advanceToFuture(when, recur, now) {
+  const { every, unit } = recur;
+  if (!every || !unit) return null;
+  let next = when.clone();
+  if (!next.isAfter(now)) {
+    const diff = now.diff(next, unit);
+    if (diff >= 0) {
+      const steps = Math.floor(diff / every) + 1;
+      next.add(steps * every, unit);
+    }
+  }
+  return next;
+}
+
+
 function detectPriority(line) {
-  if (line.includes("🔺")) return 5;        // highest
-  if (line.includes("⏫")) return 4;        // high
+  if (line.includes("🔺")) return 5;
+  if (line.includes("⏫")) return 4;
   if (line.includes("🔼")) return 3;
-  if (line.includes("🔽")) return 2;        // low
-  if (line.includes("⏬")) return 1;        // lowest
+  if (line.includes("🔽")) return 2;
+  if (line.includes("⏬")) return 1;
   return 3;
 }
 
-// Output formatter for insertion (respects 12/24 setting)
+
 function formatAt(m, insert12h) {
   if (insert12h) {
     const h = m.hour();
@@ -310,7 +589,7 @@ function formatAt(m, insert12h) {
   return `⏰ ${m.format("YYYY-MM-DD HH:mm")}`;
 }
 
-// Human-readable suggestion label (respects 12/24 setting)
+
 function humanLabel(dt, insert12h) {
   const left = insert12h
     ? dt.format("ddd YYYY-MM-DD h:mm A")
@@ -327,7 +606,7 @@ function smartPresets(now) {
   pushFut(todayAt(base, 17, 0));
   pushFut(todayAt(base, 21, 0));
   pushFut(base.clone().add(1, "day").hour(9).minute(0));
-  pushFut(nextWeekday(base, 1, true).hour(9).minute(0)); // next Monday 09:00
+  pushFut(nextWeekday(base, 1, true).hour(9).minute(0));
   return list.slice(0, 8);
 }
 
@@ -353,7 +632,7 @@ function gridCandidates(now, days, stepMinutes) {
   while (dt.isSameOrBefore(end)) {
     out.push(dt.clone());
     dt.add(stepMinutes, "minutes");
-    if (out.length > SUGGEST_MAX) break;  // soft cap
+    if (out.length > SUGGEST_MAX) break;
   }
   return out;
 }
@@ -377,13 +656,16 @@ class AtTimeDigitsSuggest extends EditorSuggest {
   onTrigger(cursor, editor) {
     const line = editor.getLine(cursor.line);
     const upto = line.slice(0, cursor.ch);
-    // Match "@" followed by zero or more digits at the end
     const m = upto.match(/@(\d*)$/);
     if (!m) return null;
     const start = cursor.ch - m[0].length;
     const end = cursor.ch;
     const digits = m[1] || "";
-    return { start: { line: cursor.line, ch: start }, end: { line: cursor.line, ch: end }, query: digits };
+    return {
+      start: { line: cursor.line, ch: start },
+      end:   { line: cursor.line, ch: end },
+      query: digits
+    };
   }
 
   getSuggestions(ctx) {
@@ -402,10 +684,10 @@ class AtTimeDigitsSuggest extends EditorSuggest {
     const candidates = gridCandidates(now, SUGGEST_DAYS, step);
     const out = [];
     for (const dt of candidates) {
-      const key = dt.format(use12h ? "YYYYMMDDhhmm" : "YYYYMMDDHHmm"); // match respects 12/24
+      const key = dt.format(use12h ? "YYYYMMDDhhmm" : "YYYYMMDDHHmm");
       if (digitSubsequence(key, q)) {
         out.push({ label: humanLabel(dt, use12h), insert: formatAt(dt, use12h) });
-        if (out.length >= 40) break; // show up to 40
+        if (out.length >= 40) break;
       }
     }
     return out.length ? out : [{ label: "No matches (keep typing digits…)", insert: null }];
@@ -470,12 +752,12 @@ class ReminderPickerModal extends Modal {
       const q = input.value.trim();
       const use12h = !!this.plugin.settings.insert12h;
 
-      // Absolute typed?
+
       const abs = parseAbsoluteUserInput(q, this.now);
       let items = [];
       if (abs) items.push(abs);
 
-      // Digit fuzzy over candidate grid
+
       const needle = (q.match(/\d+/)?.[0] ?? "");
       if (needle.length === 0) {
         items = items.concat(smartPresets(this.now));
@@ -510,7 +792,6 @@ class ReminderPickerModal extends Modal {
         const q = input.value.trim();
         const abs = parseAbsoluteUserInput(q, this.now);
         if (abs) { this.insertAndClose(abs); return; }
-        // First fuzzy or first preset
         let first = smartPresets(this.now)[0];
         if (!first) first = this.candidates[0];
         this.insertAndClose(first);
@@ -525,7 +806,7 @@ class ReminderPickerModal extends Modal {
   insertAndClose(dt) {
     const editor = this.view.editor;
     if (!editor) { this.close(); return; }
-    const ins = formatAt(dt, !!this.plugin.settings.insert12h);  // ⏰ YYYY-MM-DD ...
+    const ins = formatAt(dt, !!this.plugin.settings.insert12h);
     const cur = editor.getCursor();
     const line = editor.getLine(cur.line);
     const needsSpace = cur.ch > 0 && !/\s$/.test(line.slice(0, cur.ch));
