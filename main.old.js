@@ -14,6 +14,7 @@ const DEFAULTS = {
   tags: "",
   iconUrl: "",
   suggestStepMin: 5,
+  insert12h: true,
   dismissStatusChars: "x/-",
 
 
@@ -25,7 +26,7 @@ const DEFAULTS = {
 const RESCAN_INTERVAL_MIN = 10;
 const SUGGEST_DAYS = 14;
 const SUGGEST_MAX  = 5000;
-const SCHEDULE_DEBOUNCE_MS = 3000;
+const SCHEDULE_DEBOUNCE_MS = 2000;
 const MAX_TIMEOUT_MS = 0x7fffffff;
 
 module.exports = class NtfyReminders extends Plugin {
@@ -34,8 +35,6 @@ module.exports = class NtfyReminders extends Plugin {
     this.timerHandles = new Map();
     this.fileTimers = new Map();
     this.pendingRescans = new Map();
-    this.recentInsert = null; // { time: number, filePath: string, lineIndex: number }
-    this.recentInsertTimer = null;
 
     this.settings = Object.assign({}, DEFAULTS, await this.loadData());
 
@@ -85,7 +84,6 @@ module.exports = class NtfyReminders extends Plugin {
     for (const h of this.pendingRescans.values()) window.clearTimeout(h);
     this.pendingRescans.clear();
     this.fileTimers.clear();
-    if (this.recentInsertTimer) window.clearTimeout(this.recentInsertTimer);
   }
 
   async saveSettings() { await this.saveData(this.settings); }
@@ -113,65 +111,17 @@ module.exports = class NtfyReminders extends Plugin {
     console.log("[NTFY Reminders] cleared ALL timers (role is SILENT)");
   }
 
-  /** Mark a recent insert and start a timeout to show inactive if not scheduled */
-  noteRecentInsert(filePath, lineIndex) {
-    this.recentInsert = { time: Date.now(), filePath, lineIndex };
-    if (this.recentInsertTimer) window.clearTimeout(this.recentInsertTimer);
-    this.recentInsertTimer = window.setTimeout(async () => {
-      try {
-        const ri = this.recentInsert;
-        if (!ri) return;
-        const { filePath, lineIndex } = ri;
-        const f = this.app.vault.getAbstractFileByPath(filePath);
-        if (!(f instanceof TFile)) return;
-        const text = await this.app.vault.read(f);
-        const lines = text.split(/\r?\n/);
-        const line = lines[lineIndex] ?? "";
-        const now = moment();
-        let active = false;
-        const matches = parseClockEmojiAll(line);
-        for (const p of matches) {
-          let { when, recur } = p;
-          if (!when.isValid()) continue;
-          let firstWhen = when.clone();
-          if (recur) {
-            firstWhen = advanceToFuture(firstWhen, recur, now);
-            if (!firstWhen || !firstWhen.isValid()) continue;
-          }
-          if (firstWhen.isAfter(now)) { active = true; break; }
-        }
-        if (!active) new Notice("Reminder inactive — time needed");
-      } catch (e) {
-        console.warn("[NTFY Reminders] recentInsert check failed", e);
-      } finally {
-        this.recentInsert = null;
-      }
-    }, 32000);
-  }
-
-  // Ghost placeholder removed in favor of selected inline placeholder
-
   /** Debounced re-schedule for one file after edits */
   queueReschedule(file) {
     if (!this.isSender) return;
     const key = file.path;
     const prev = this.pendingRescans.get(key);
-    if (prev) window.clearTimeout(prev.handle ?? prev);
-
-    // Capture the currently edited line if this file is active
-    let editedLineIndex = undefined;
-    try {
-      const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-      if (view && view.file && view.file.path === file.path) {
-        editedLineIndex = view.editor.getCursor().line;
-      }
-    } catch (_) {}
-
+    if (prev) window.clearTimeout(prev);
     const handle = window.setTimeout(async () => {
       this.pendingRescans.delete(key);
-      await this.scheduleFileFresh(file, editedLineIndex);
+      await this.scheduleFileFresh(file);
     }, SCHEDULE_DEBOUNCE_MS);
-    this.pendingRescans.set(key, { handle, lineIndex: editedLineIndex });
+    this.pendingRescans.set(key, handle);
   }
 
   /** Full vault rescan: if silent, just clear; else clear per-file timers first, then schedule */
@@ -185,7 +135,7 @@ module.exports = class NtfyReminders extends Plugin {
         new Notice("NTFY: silent (not sender) – no notifications from this device");
         return;
       }
-      for (const f of files) await this.scheduleFileFresh(f, undefined);
+      for (const f of files) await this.scheduleFileFresh(f);
       new Notice("NTFY: vault scanned");
     } catch (e) {
       console.error("[NTFY Reminders] scanVault error:", e);
@@ -193,22 +143,21 @@ module.exports = class NtfyReminders extends Plugin {
   }
 
   /** Clear all timers for a file, then parse & schedule fresh */
-  async scheduleFileFresh(file, editedLineIndex) {
+  async scheduleFileFresh(file) {
     try {
       if (!this.isSender) { this.clearTimersForFile(file.path); return; }
       this.clearTimersForFile(file.path);
-      await this.scheduleFromFileNoClear(file, editedLineIndex);
+      await this.scheduleFromFileNoClear(file);
     } catch (e) {
       console.error("[NTFY Reminders] scheduleFileFresh error:", file?.path, e);
     }
   }
 
   /** INTERNAL: parse/schedule without clearing first (only when sender) */
-  async scheduleFromFileNoClear(file, editedLineIndex) {
+  async scheduleFromFileNoClear(file) {
     if (!this.isSender) return;
     const text = await this.app.vault.read(file);
     const lines = text.split(/\r?\n/);
-    let scheduledEditedLine = false;
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
 
@@ -222,9 +171,6 @@ module.exports = class NtfyReminders extends Plugin {
 
       const matches = parseClockEmojiAll(line);
       if (!matches.length) continue;
-
-      // Clear any previously scheduled timers for this specific line before scheduling new ones
-      this.clearTimersForLine(file.path, i);
 
       const prio = detectPriority(line);
       for (const p of matches) {
@@ -245,14 +191,7 @@ module.exports = class NtfyReminders extends Plugin {
         }
 
         this.scheduleOneReminder(file.path, i, firstWhen, prio, context || line, offset, recur);
-        if (editedLineIndex != null && i === editedLineIndex && firstWhen.isAfter(now)) {
-          scheduledEditedLine = true;
-        }
       }
-    }
-    if (editedLineIndex != null && scheduledEditedLine) {
-      // Avoid double-toast if this came from a fresh insert flow
-      if (!this.recentInsert) new Notice("Reminder set");
     }
   }
 
@@ -310,14 +249,6 @@ module.exports = class NtfyReminders extends Plugin {
     this.timerHandles.set(id, handle);
     if (!this.fileTimers.has(filePath)) this.fileTimers.set(filePath, new Set());
     this.fileTimers.get(filePath).add(id);
-
-    try {
-      const ri = this.recentInsert;
-      if (ri && ri.filePath === filePath && ri.lineIndex === lineIndex && (Date.now() - ri.time) < 30000) {
-        new Notice("Reminder set");
-        this.recentInsert = null;
-      }
-    } catch (_) { /* noop */ }
   }
 
   /** Cancel and forget all timers tied to this file */
@@ -331,22 +262,6 @@ module.exports = class NtfyReminders extends Plugin {
     }
     this.fileTimers.delete(filePath);
     console.log("[NTFY Reminders] cleared timers for file:", filePath);
-  }
-
-  /** Cancel timers only for a specific line within a file */
-  clearTimersForLine(filePath, lineIndex) {
-    const ids = this.fileTimers.get(filePath);
-    if (!ids) return;
-    const prefix = `${filePath}#${lineIndex}#`;
-    for (const id of Array.from(ids)) {
-      if (id.startsWith(prefix)) {
-        const h = this.timerHandles.get(id);
-        if (h) window.clearTimeout(h);
-        this.timerHandles.delete(id);
-        ids.delete(id);
-      }
-    }
-    if (ids.size === 0) this.fileTimers.delete(filePath);
   }
 
   async sendNtfy(text, priority = 3) {
@@ -421,12 +336,19 @@ class NtfySettingsTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Fuzzy @ step (minutes)")
-      .setDesc("Interval for legacy @ time suggestions (1–60 minutes)")
+      .setDesc("Interval for @ time suggestions (1–60 minutes)")
       .addSlider(sl => sl
         .setLimits(1, 60, 1)
         .setDynamicTooltip()
         .setValue(this.plugin.settings.suggestStepMin)
         .onChange(async v => { this.plugin.settings.suggestStepMin = v; await this.plugin.saveSettings(); }));
+
+    new Setting(containerEl)
+      .setName("Picker inserts 12-hour times")
+      .setDesc("If off, inserts 24-hour times like 17:00")
+      .addToggle(tg => tg
+        .setValue(!!this.plugin.settings.insert12h)
+        .onChange(async v => { this.plugin.settings.insert12h = v; await this.plugin.saveSettings(); }));
 
     new Setting(containerEl)
       .setName("Dismiss task statuses")
@@ -656,12 +578,23 @@ function detectPriority(line) {
 }
 
 
-function formatDateInsert(m) {
-  return `⏰ ${m.format("YYYY-MM-DD")} `;
+function formatAt(m, insert12h) {
+  if (insert12h) {
+    const h = m.hour();
+    const ap = h >= 12 ? "PM" : "AM";
+    const h12 = h % 12 === 0 ? 12 : (h % 12);
+    const mins = String(m.minute()).padStart(2, "0");
+    return `⏰ ${m.format("YYYY-MM-DD")} ${h12}:${mins} ${ap}`;
+  }
+  return `⏰ ${m.format("YYYY-MM-DD HH:mm")}`;
 }
 
-function humanDateLabel(dt) {
-  return `${dt.format("ddd YYYY-MM-DD")}  (${dt.fromNow()})`;
+
+function humanLabel(dt, insert12h) {
+  const left = insert12h
+    ? dt.format("ddd YYYY-MM-DD h:mm A")
+    : dt.format("ddd YYYY-MM-DD HH:mm");
+  return `${left}  (${dt.fromNow()})`;
 }
 
 function smartPresets(now) {
@@ -710,102 +643,11 @@ function digitSubsequence(hay, needle) {
   return j === needle.length;
 }
 
-/** ===== Natural language dates (date-only) ===== **/
-const NUM_WORDS = {
-  one: 1, two: 2, three: 3, four: 4, five: 5,
-  six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
-  eleven: 11, twelve: 12, thirteen: 13, fourteen: 14,
-  fifteen: 15, sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19,
-  twenty: 20,
-};
-
-const DOW = {
-  sun: 7, sunday: 7,
-  mon: 1, monday: 1,
-  tue: 2, tues: 2, tuesday: 2,
-  wed: 3, weds: 3, wednesday: 3,
-  thu: 4, thur: 4, thurs: 4, thursday: 4,
-  fri: 5, friday: 5,
-  sat: 6, saturday: 6,
-};
-
-function parseNaturalDateOrAbsolute(s, base) {
-  if (!s) return null;
-  const q = s.trim().toLowerCase();
-  if (!q) return null;
-
-  // Absolute YYYY-MM-DD
-  if (/^\d{4}-\d{2}-\d{2}$/.test(q)) {
-    const dt = moment(q, "YYYY-MM-DD", true);
-    return dt.isValid() ? dt : null;
-  }
-
-  // today / tomorrow / yesterday
-  if (q === "today") return base.clone();
-  if (q === "tomorrow") return base.clone().add(1, "day");
-  if (q === "yesterday") return base.clone().subtract(1, "day");
-
-  // next <weekday> or just <weekday>
-  const dowMatch = q.match(/^(next\s+)?(sun(day)?|mon(day)?|tue(s|sday)?|wed(nesday)?|thu(r|rs|rsday)?|fri(day)?|sat(urday)?)$/);
-  if (dowMatch) {
-    const forceNext = !!dowMatch[1];
-    const tok = dowMatch[2];
-    const iso = DOW[tok.startsWith("thu") ? "thu" : tok.substring(0,3)];
-    return nextWeekday(base.clone().startOf("day"), iso, forceNext);
-  }
-
-  // in <n> <unit> | <n> <unit> | <word> <unit>
-  const rel = q.match(/^(?:in\s+)?(\d+|[a-z-]+)\s*(days?|d|weeks?|w|months?|mo|mons?|mon(th)?s?)$/);
-  if (rel) {
-    const nTok = rel[1];
-    const unitTok = rel[2];
-    let n = parseInt(nTok, 10);
-    if (Number.isNaN(n)) n = NUM_WORDS[nTok.replace(/-/g, "")] || null;
-    if (n != null && n >= 0) {
-      let unit = null;
-      if (/^d(ays?)?$/.test(unitTok)) unit = "days";
-      else if (/^w(eeks?)?$|^w$/.test(unitTok)) unit = "weeks";
-      else if (/^mo(n(th)?s?)?$/.test(unitTok)) unit = "months";
-      if (unit) return base.clone().add(n, unit);
-    }
-  }
-
-  return null;
-}
-
-function datePresets(now) {
-  const list = [];
-  const base = now.clone().startOf("day");
-  list.push(base.clone()); // today
-  list.push(base.clone().add(1, "day")); // tomorrow
-  list.push(nextWeekday(base, 1, true)); // next Monday
-  list.push(nextWeekday(base, 5, true)); // next Friday
-  list.push(base.clone().add(1, "week"));
-  list.push(base.clone().add(2, "weeks"));
-  return list;
-}
-
 function clampInt(n, lo, hi) {
   const x = parseInt(n, 10);
   if (Number.isNaN(x)) return lo;
   return Math.max(lo, Math.min(hi, x));
 }
-
-function safePosToOffset(editor, pos) {
-  try { if (typeof editor.posToOffset === 'function') return editor.posToOffset(pos); } catch (_) {}
-  const lines = editor.lineCount ? editor.lineCount() : (editor.lastLine ? editor.lastLine() + 1 : 0);
-  let off = 0;
-  const maxLine = Math.min(pos.line, lines - 1);
-  for (let i = 0; i < maxLine; i++) {
-    const s = editor.getLine(i) || "";
-    off += s.length + 1; // assume \n
-  }
-  off += pos.ch;
-  return off;
-}
-
-// Ghost typing helpers
-// Editor decorations removed; using selected inline placeholder instead
 
 /** ===== Digit-fuzzy @time suggest (inserts ⏰ …) ===== **/
 class AtTimeDigitsSuggest extends EditorSuggest {
@@ -814,7 +656,7 @@ class AtTimeDigitsSuggest extends EditorSuggest {
   onTrigger(cursor, editor) {
     const line = editor.getLine(cursor.line);
     const upto = line.slice(0, cursor.ch);
-    const m = upto.match(/@([^@]*)$/);
+    const m = upto.match(/@(\d*)$/);
     if (!m) return null;
     const start = cursor.ch - m[0].length;
     const end = cursor.ch;
@@ -829,20 +671,26 @@ class AtTimeDigitsSuggest extends EditorSuggest {
   getSuggestions(ctx) {
     const now = moment();
     const q = ctx.query.trim();
+    const step = clampInt(this.plugin.settings.suggestStepMin ?? 5, 1, 60);
+    const use12h = !!this.plugin.settings.insert12h;
 
     if (q === "") {
-      return datePresets(now).map(dt => ({
-        label: humanDateLabel(dt),
-        insert: formatDateInsert(dt)
+      return smartPresets(now).map(dt => ({
+        label: humanLabel(dt, use12h),
+        insert: formatAt(dt, use12h)
       }));
     }
 
-    const dt = parseNaturalDateOrAbsolute(q, now);
-    if (dt) {
-      return [{ label: humanDateLabel(dt), insert: formatDateInsert(dt) }];
+    const candidates = gridCandidates(now, SUGGEST_DAYS, step);
+    const out = [];
+    for (const dt of candidates) {
+      const key = dt.format(use12h ? "YYYYMMDDhhmm" : "YYYYMMDDHHmm");
+      if (digitSubsequence(key, q)) {
+        out.push({ label: humanLabel(dt, use12h), insert: formatAt(dt, use12h) });
+        if (out.length >= 40) break;
+      }
     }
-
-    return datePresets(now).map(dt => ({ label: humanDateLabel(dt), insert: formatDateInsert(dt) }));
+    return out.length ? out : [{ label: "No matches (keep typing digits…)", insert: null }];
   }
 
   renderSuggestion(s, el) { el.setText(s.label); }
@@ -853,16 +701,8 @@ class AtTimeDigitsSuggest extends EditorSuggest {
     if (!view) return;
     const editor = view.editor;
     const ctx = this.context; if (!ctx) return;
-    const base = s.insert + "hh:mm AM";
-    editor.replaceRange(base, ctx.start, ctx.end);
-    const selStart = { line: ctx.start.line, ch: ctx.start.ch + s.insert.length };
-    const selEnd   = { line: ctx.start.line, ch: ctx.start.ch + base.length };
-    editor.setSelection(selStart, selEnd);
-    try {
-      const file = view.file;
-      if (file) this.plugin.noteRecentInsert(file.path, ctx.start.line);
-    } catch (_) {}
-    new Notice("Entering reminder — time needed");
+    editor.replaceRange(s.insert, ctx.start, ctx.end);
+    editor.setCursor({ line: ctx.start.line, ch: ctx.start.ch + s.insert.length });
   }
 }
 
@@ -879,6 +719,8 @@ class ReminderPickerModal extends Modal {
     this.plugin = plugin;
     this.view = view;
     this.now = moment();
+    this.step = clampInt(plugin.settings.suggestStepMin ?? 5, 1, 60);
+    this.candidates = gridCandidates(this.now, SUGGEST_DAYS, this.step);
   }
 
   onOpen() {
@@ -887,83 +729,73 @@ class ReminderPickerModal extends Modal {
     contentEl.createEl("h3", { text: "Insert reminder time" });
 
     const input = contentEl.createEl("input", { type: "text" });
-    input.placeholder = "Natural date (e.g. tomorrow, two weeks, 2025-08-12). Type time after.";
+    input.placeholder = "Digits (e.g. 930) or absolute: 2025-08-12 9:30 pm";
     input.classList.add("ntfy-time-input");
 
     const list = contentEl.createDiv();
     list.style.marginTop = "10px";
-    list.classList.add("ntfy-picker-list");
 
     const chips = contentEl.createDiv();
     chips.style.marginTop = "8px";
     for (const c of [
-      { label: "today", dt: this.now.clone() },
-      { label: "tomorrow", dt: this.now.clone().add(1, "day") },
-      { label: "next Monday", dt: nextWeekday(this.now.clone().startOf("day"), 1, true) },
-      { label: "in 2 weeks", dt: this.now.clone().add(2, "weeks") },
+      { label: "in 30m", dt: this.now.clone().add(30, "minutes") },
+      { label: "in 1h",  dt: this.now.clone().add(1, "hour") },
+      { label: "today 17:00", dt: todayAt(this.now, 17, 0) },
+      { label: "tomorrow 09:00", dt: this.now.clone().add(1,"day").hour(9).minute(0).second(0).millisecond(0) },
     ]) {
       const b = chips.createEl("button", { text: c.label });
       b.style.marginRight = "6px";
       b.addEventListener("click", () => this.insertAndClose(c.dt));
     }
 
-    let itemsState = [];
-    let active = 0;
-
     const render = () => {
       const q = input.value.trim();
+      const use12h = !!this.plugin.settings.insert12h;
+
+
+      const abs = parseAbsoluteUserInput(q, this.now);
       let items = [];
-      const parsed = parseNaturalDateOrAbsolute(q, this.now);
-      if (parsed) items.push(parsed);
-      if (items.length === 0) items = datePresets(this.now);
-      itemsState = items;
+      if (abs) items.push(abs);
+
+
+      const needle = (q.match(/\d+/)?.[0] ?? "");
+      if (needle.length === 0) {
+        items = items.concat(smartPresets(this.now));
+      } else {
+        for (const dt of this.candidates) {
+          const key = dt.format(use12h ? "YYYYMMDDhhmm" : "YYYYMMDDHHmm");
+          if (digitSubsequence(key, needle)) {
+            items.push(dt);
+            if (items.length >= 40) break;
+          }
+        }
+      }
 
       list.empty();
       if (items.length === 0) {
-        list.setText("No matches (type a natural date like 'two weeks').");
+        list.setText("No matches (type digits like 930 or an absolute date/time).");
       } else {
-        active = Math.min(active, items.length - 1);
-        items.slice(0, 40).forEach((dt, idx) => {
+        for (const dt of items.slice(0, 40)) {
           const row = list.createDiv();
           row.classList.add("ntfy-row");
           row.style.padding = "6px 8px";
           row.style.cursor = "pointer";
-          row.setText(`${humanDateLabel(dt)} → ${formatDateInsert(dt)}`);
-          if (idx === active) {
-            row.classList.add("active");
-            row.style.background = "var(--background-modifier-hover)";
-          }
+          row.setText(`${humanLabel(dt, use12h)} → ${formatAt(dt, use12h)}`);
           row.addEventListener("click", () => this.insertAndClose(dt));
-          row.addEventListener("mouseenter", () => {
-            active = idx; render();
-          });
-        });
+        }
       }
     };
 
     input.addEventListener("input", render);
     input.addEventListener("keydown", (e) => {
       if (e.key === "Enter") {
-        e.preventDefault();
-        e.stopPropagation();
         const q = input.value.trim();
-        const parsed = parseNaturalDateOrAbsolute(q, this.now);
-        if (parsed) { this.insertAndClose(parsed); return; }
-        const pick = itemsState[active] || itemsState[0];
-        if (pick) this.insertAndClose(pick);
-      } else if (e.key === "ArrowDown") {
-        e.preventDefault();
-        e.stopPropagation();
-        active = Math.min(active + 1, itemsState.length - 1);
-        render();
-      } else if (e.key === "ArrowUp") {
-        e.preventDefault();
-        e.stopPropagation();
-        active = Math.max(active - 1, 0);
-        render();
+        const abs = parseAbsoluteUserInput(q, this.now);
+        if (abs) { this.insertAndClose(abs); return; }
+        let first = smartPresets(this.now)[0];
+        if (!first) first = this.candidates[0];
+        this.insertAndClose(first);
       } else if (e.key === "Escape") {
-        e.preventDefault();
-        e.stopPropagation();
         this.close();
       }
     });
@@ -974,20 +806,12 @@ class ReminderPickerModal extends Modal {
   insertAndClose(dt) {
     const editor = this.view.editor;
     if (!editor) { this.close(); return; }
-    const ins = formatDateInsert(dt);
+    const ins = formatAt(dt, !!this.plugin.settings.insert12h);
     const cur = editor.getCursor();
     const line = editor.getLine(cur.line);
     const needsSpace = cur.ch > 0 && !/\s$/.test(line.slice(0, cur.ch));
-    const base = (needsSpace ? " " : "") + ins + "hh:mm AM";
-    editor.replaceRange(base, cur);
-    const selStart = { line: cur.line, ch: cur.ch + (needsSpace ? 1 : 0) + ins.length };
-    const selEnd   = { line: cur.line, ch: cur.ch + base.length };
-    editor.setSelection(selStart, selEnd);
-    try {
-      const file = this.view.file;
-      if (file) this.plugin.noteRecentInsert(file.path, cur.line);
-    } catch (_) {}
-    new Notice("Entering reminder — time needed");
+    editor.replaceRange((needsSpace ? " " : "") + ins, cur);
+    editor.setCursor({ line: cur.line, ch: cur.ch + ins.length + (needsSpace ? 1 : 0) });
     this.close();
   }
 

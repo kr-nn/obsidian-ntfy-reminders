@@ -22,8 +22,7 @@ You can put reminders anywhere in your Markdown. The plugin looks for **clock st
 ⏰ 2025-09-01 9:00 AM
 ```
 
-* 12-hour or 24-hour format is configurable in settings.
-* Minutes are optional in typing (we’ll still insert `HH:mm`).
+* Minutes are optional while typing (we’ll still parse `HH:mm`).
 * You can add recurrence by appending: `every 2 hours`, `every 1 days`, `every 3 weeks`, etc.
 
 Examples:
@@ -35,12 +34,11 @@ Drink water ⏰ 2025-08-16 14:00 every 2 hours
 
 ### 3) Fast entry with `@` or a hotkey
 
-* Type `@` to open a **fuzzy time suggest**.
+* Type `@` to open a **natural date suggest**.
 
-  * `@` alone shows smart presets (in 30m, tomorrow 09:00, etc.)
-  * `@930` filters to times whose digits contain `9-3-0` in order (date+time window).
-  * Picks are inserted as a proper clock stamp: `⏰ YYYY-MM-DD HH:mm [AM/PM]`.
-* Press **Ctrl+R** (default) anywhere to open a small picker modal with the same fuzzy search and presets.
+  * Type phrases like `two weeks`, `tomorrow`, `next monday`, or an absolute date like `2025-08-12`.
+* The picker inserts the date plus a selected placeholder `hh:mm AM`: `⏰ YYYY-MM-DD hh:mm AM` — type to replace it; you can use 12h or 24h.
+* Press **Ctrl+R** (default) anywhere to open a small picker modal with the same natural-date suggestions.
 
 ### 4) Tasks lines (optional)
 
@@ -87,12 +85,8 @@ If you have multiple Obsidian instances on the same vault, you can choose which 
 * **ntfy integration**
   Sends to your ntfy server/topic with optional **Authorization** header, custom **Title**, **Tags**, and an **Icon URL** (so notifications show a custom image).
 
-* **12-hour / 24-hour**
-  Picker and insert format respect your setting.
-
-* **Fuzzy `@` time suggest**
-  Type `@` then digits to filter a time grid intelligently (down to configurable minute steps).
-  `@2515` matches any date/time containing `2-5-1-5` in order.
+* **Natural-date `@` suggest**
+  Type phrases like `two weeks`, `tomorrow`, or `next monday`, and it will insert `⏰ YYYY-MM-DD ` so you can add the time you prefer.
 
 * **Hotkey**
   Default **Ctrl+R** opens the reminder picker modal anywhere.
@@ -128,11 +122,7 @@ If you have multiple Obsidian instances on the same vault, you can choose which 
 **Input & Formatting**
 
 * **Fuzzy @ step (minutes)**
-  Grid step for the suggestion list (default 5).
-  *Controls the granularity of suggested times.*
-* **Picker inserts 12-hour times**
-  On = “9:00 AM”, Off = “09:00”.
-  *Match your region/brain’s time style.*
+  Legacy time-grid step (default 5). Kept for compatibility; the new natural-date suggest inserts dates only.
 
 **Tasks Integration**
 
